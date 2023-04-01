@@ -29,6 +29,8 @@
 ////////////////////////////////////////////////////////////
 #include <SFML/Window/Export.hpp>
 
+#include <memory>
+
 
 namespace sf
 {
@@ -51,23 +53,24 @@ protected:
     GlResource();
 
     ////////////////////////////////////////////////////////////
-    /// \brief Destructor
-    ///
-    ////////////////////////////////////////////////////////////
-    ~GlResource();
-
-    ////////////////////////////////////////////////////////////
-    /// \brief Register a function to be called when a context is destroyed
+    /// \brief Register an OpenGL object to be destroyed when its containing context is destroyed
     ///
     /// This is used for internal purposes in order to properly
-    /// clean up OpenGL resources that cannot be shared between
+    /// clean up OpenGL resources that cannot be shared bwteen
     /// contexts.
     ///
-    /// \param callback Function to be called when a context is destroyed
-    /// \param arg      Argument to pass when calling the function
+    /// \param object Object to be destroyed when its containing context is destroyed
     ///
     ////////////////////////////////////////////////////////////
-    static void registerContextDestroyCallback(ContextDestroyCallback callback, void* arg);
+    static void registerUnsharedGlObject(std::shared_ptr<void> object);
+
+    ////////////////////////////////////////////////////////////
+    /// \brief Unregister an OpenGL object from its containing context
+    ///
+    /// \param object Object to be unregister
+    ///
+    ////////////////////////////////////////////////////////////
+    static void unregisterUnsharedGlObject(std::shared_ptr<void> object);
 
     ////////////////////////////////////////////////////////////
     /// \brief RAII helper class to temporarily lock an available context for use
@@ -100,6 +103,12 @@ protected:
         ////////////////////////////////////////////////////////////
         TransientContextLock& operator=(const TransientContextLock&) = delete;
     };
+
+private:
+    ////////////////////////////////////////////////////////////
+    // Member data
+    ////////////////////////////////////////////////////////////
+    std::shared_ptr<void> m_sharedContext; //!< Shared context used to link all contexts together for resource sharing
 };
 
 } // namespace sf

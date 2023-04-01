@@ -34,110 +34,37 @@
 
 #include <mutex>
 #include <ostream>
-#include <set>
-#include <unordered_map>
-#include <unordered_set>
-#include <utility>
-
-
-namespace
-{
-// Set to track all active FBO mappings
-// This is used to free active FBOs while their owning
-// RenderTextureImplFBO is still alive
-std::unordered_set<std::unordered_map<std::uint64_t, unsigned int>*> frameBuffers;
-
-// Set to track all stale FBOs
-// This is used to free stale FBOs after their owning
-// RenderTextureImplFBO has already been destroyed
-// An FBO cannot be destroyed until it's containing context
-// becomes active, so the destruction of the RenderTextureImplFBO
-// has to be decoupled from the destruction of the FBOs themselves
-std::set<std::pair<std::uint64_t, unsigned int>> staleFrameBuffers;
-
-// Mutex to protect both active and stale frame buffer sets
-std::recursive_mutex mutex;
-
-// This function is called either when a RenderTextureImplFBO is
-// destroyed or via contextDestroyCallback when context destruction
-// might trigger deletion of its contained stale FBOs
-void destroyStaleFBOs()
-{
-    std::uint64_t contextId = sf::Context::getActiveContextId();
-
-    for (auto it = staleFrameBuffers.begin(); it != staleFrameBuffers.end();)
-    {
-        if (it->first == contextId)
-        {
-            auto frameBuffer = static_cast<GLuint>(it->second);
-            glCheck(GLEXT_glDeleteFramebuffers(1, &frameBuffer));
-
-            staleFrameBuffers.erase(it++);
-        }
-        else
-        {
-            ++it;
-        }
-    }
-}
-
-// Callback that is called every time a context is destroyed
-void contextDestroyCallback(void* /*arg*/)
-{
-    std::lock_guard lock(mutex);
-
-    std::uint64_t contextId = sf::Context::getActiveContextId();
-
-    // Destroy active frame buffer objects
-    for (auto* frameBuffer : frameBuffers)
-    {
-        for (auto it = frameBuffer->begin(); it != frameBuffer->end(); ++it)
-        {
-            if (it->first == contextId)
-            {
-                GLuint frameBufferId = it->second;
-                glCheck(GLEXT_glDeleteFramebuffers(1, &frameBufferId));
-
-                // Erase the entry from the RenderTextureImplFBO's map
-                frameBuffer->erase(it);
-
-                break;
-            }
-        }
-    }
-
-    // Destroy stale frame buffer objects
-    destroyStaleFBOs();
-}
-} // namespace
 
 
 namespace sf::priv
 {
 ////////////////////////////////////////////////////////////
-RenderTextureImplFBO::RenderTextureImplFBO()
+struct RenderTextureImplFBO::FrameBufferObject
 {
-    std::lock_guard lock(mutex);
+    FrameBufferObject()
+    {
+        // Create the framebuffer object
+        glCheck(GLEXT_glGenFramebuffers(1, &object));
+    }
 
-    // Register the context destruction callback
-    registerContextDestroyCallback(contextDestroyCallback, nullptr);
+    ~FrameBufferObject()
+    {
+        if (object)
+            glCheck(GLEXT_glDeleteFramebuffers(1, &object));
+    }
 
-    // Insert the new frame buffer mapping into the set of all active mappings
-    frameBuffers.insert(&m_frameBuffers);
-    frameBuffers.insert(&m_multisampleFrameBuffers);
-}
+    GLuint object{};
+};
+
+
+////////////////////////////////////////////////////////////
+RenderTextureImplFBO::RenderTextureImplFBO() = default;
 
 
 ////////////////////////////////////////////////////////////
 RenderTextureImplFBO::~RenderTextureImplFBO()
 {
     TransientContextLock contextLock;
-
-    std::lock_guard lock(mutex);
-
-    // Remove the frame buffer mapping from the set of all active mappings
-    frameBuffers.erase(&m_frameBuffers);
-    frameBuffers.erase(&m_multisampleFrameBuffers);
 
     // Destroy the color buffer
     if (m_colorBuffer)
@@ -153,15 +80,22 @@ RenderTextureImplFBO::~RenderTextureImplFBO()
         glCheck(GLEXT_glDeleteRenderbuffers(1, &depthStencilBuffer));
     }
 
-    // Move all frame buffer objects to stale set
-    for (auto& [contextId, frameBufferId] : m_frameBuffers)
-        staleFrameBuffers.emplace(contextId, frameBufferId);
+    // Unregister FBOs with the contexts if they haven't already been destroyed
+    for (auto& entry : m_frameBuffers)
+    {
+        auto frameBuffer = entry.second.lock();
 
-    for (auto& [contextId, multisampleFrameBufferId] : m_multisampleFrameBuffers)
-        staleFrameBuffers.emplace(contextId, multisampleFrameBufferId);
+        if (frameBuffer)
+            unregisterUnsharedGlObject(frameBuffer);
+    }
 
-    // Clean up FBOs
-    destroyStaleFBOs();
+    for (auto& entry : m_multisampleFrameBuffers)
+    {
+        auto frameBuffer = entry.second.lock();
+
+        if (frameBuffer)
+            unregisterUnsharedGlObject(frameBuffer);
+    }
 }
 
 
@@ -420,15 +354,14 @@ bool RenderTextureImplFBO::create(const Vector2u& size, unsigned int textureId, 
 bool RenderTextureImplFBO::createFrameBuffer()
 {
     // Create the framebuffer object
-    GLuint frameBuffer = 0;
-    glCheck(GLEXT_glGenFramebuffers(1, &frameBuffer));
+    auto frameBuffer = std::make_shared<FrameBufferObject>();
 
-    if (!frameBuffer)
+    if (!frameBuffer->object)
     {
         err() << "Impossible to create render texture (failed to create the frame buffer object)" << std::endl;
         return false;
     }
-    glCheck(GLEXT_glBindFramebuffer(GLEXT_GL_FRAMEBUFFER, frameBuffer));
+    glCheck(GLEXT_glBindFramebuffer(GLEXT_GL_FRAMEBUFFER, frameBuffer->object));
 
     // Link the depth/stencil renderbuffer to the frame buffer
     if (!m_multisample && m_depthStencilBuffer)
@@ -460,33 +393,30 @@ bool RenderTextureImplFBO::createFrameBuffer()
     if (status != GLEXT_GL_FRAMEBUFFER_COMPLETE)
     {
         glCheck(GLEXT_glBindFramebuffer(GLEXT_GL_FRAMEBUFFER, 0));
-        glCheck(GLEXT_glDeleteFramebuffers(1, &frameBuffer));
         err() << "Impossible to create render texture (failed to link the target texture to the frame buffer)" << std::endl;
         return false;
     }
 
-    {
-        std::lock_guard lock(mutex);
+    // Insert the FBO into our map
+    m_frameBuffers.emplace(Context::getActiveContextId(), frameBuffer);
 
-        // Insert the FBO into our map
-        m_frameBuffers.emplace(Context::getActiveContextId(), frameBuffer);
-    }
+    // Register the object with the currently context so it is automatically destroyed
+    registerUnsharedGlObject(frameBuffer);
 
 #ifndef SFML_OPENGL_ES
 
     if (m_multisample)
     {
         // Create the multisample framebuffer object
-        GLuint multisampleFrameBuffer = 0;
-        glCheck(GLEXT_glGenFramebuffers(1, &multisampleFrameBuffer));
+        auto multisampleFrameBuffer = std::make_shared<FrameBufferObject>();
 
-        if (!multisampleFrameBuffer)
+        if (!multisampleFrameBuffer->object)
         {
             err() << "Impossible to create render texture (failed to create the multisample frame buffer object)"
                   << std::endl;
             return false;
         }
-        glCheck(GLEXT_glBindFramebuffer(GLEXT_GL_FRAMEBUFFER, multisampleFrameBuffer));
+        glCheck(GLEXT_glBindFramebuffer(GLEXT_GL_FRAMEBUFFER, multisampleFrameBuffer->object));
 
         // Link the multisample color buffer to the frame buffer
         glCheck(GLEXT_glBindRenderbuffer(GLEXT_GL_RENDERBUFFER, m_colorBuffer));
@@ -515,19 +445,17 @@ bool RenderTextureImplFBO::createFrameBuffer()
         if (status != GLEXT_GL_FRAMEBUFFER_COMPLETE)
         {
             glCheck(GLEXT_glBindFramebuffer(GLEXT_GL_FRAMEBUFFER, 0));
-            glCheck(GLEXT_glDeleteFramebuffers(1, &multisampleFrameBuffer));
             err() << "Impossible to create render texture (failed to link the render buffers to the multisample frame "
                      "buffer)"
                   << std::endl;
             return false;
         }
 
-        {
-            std::lock_guard lock(mutex);
+        // Insert the FBO into our map
+        m_multisampleFrameBuffers.emplace(Context::getActiveContextId(), multisampleFrameBuffer);
 
-            // Insert the FBO into our map
-            m_multisampleFrameBuffers.emplace(Context::getActiveContextId(), multisampleFrameBuffer);
-        }
+        // Register the object with the currently context so it is automatically destroyed
+        registerUnsharedGlObject(multisampleFrameBuffer);
     }
 
 #endif
@@ -573,29 +501,35 @@ bool RenderTextureImplFBO::activate(bool active)
     // Lookup the FBO corresponding to the currently active context
     // If none is found, there is no FBO corresponding to the
     // currently active context so we will have to create a new FBO
+    FrameBufferObjectMap::iterator it;
+
+    if (m_multisample)
     {
-        std::lock_guard lock(mutex);
+        it = m_multisampleFrameBuffers.find(contextId);
 
-        std::unordered_map<std::uint64_t, unsigned int>::iterator it;
-
-        if (m_multisample)
+        if (it != m_multisampleFrameBuffers.end())
         {
-            it = m_multisampleFrameBuffers.find(contextId);
+            auto frameBuffer = it->second.lock();
 
-            if (it != m_multisampleFrameBuffers.end())
+            if (frameBuffer)
             {
-                glCheck(GLEXT_glBindFramebuffer(GLEXT_GL_FRAMEBUFFER, it->second));
+                glCheck(GLEXT_glBindFramebuffer(GLEXT_GL_FRAMEBUFFER, frameBuffer->object));
 
                 return true;
             }
         }
-        else
-        {
-            it = m_frameBuffers.find(contextId);
+    }
+    else
+    {
+        it = m_frameBuffers.find(contextId);
 
-            if (it != m_frameBuffers.end())
+        if (it != m_frameBuffers.end())
+        {
+            auto frameBuffer = it->second.lock();
+
+            if (frameBuffer)
             {
-                glCheck(GLEXT_glBindFramebuffer(GLEXT_GL_FRAMEBUFFER, it->second));
+                glCheck(GLEXT_glBindFramebuffer(GLEXT_GL_FRAMEBUFFER, frameBuffer->object));
 
                 return true;
             }
@@ -628,26 +562,30 @@ void RenderTextureImplFBO::updateTexture(unsigned int)
     {
         std::uint64_t contextId = Context::getActiveContextId();
 
-        std::lock_guard lock(mutex);
-
         auto frameBufferIt = m_frameBuffers.find(contextId);
         auto multisampleIt = m_multisampleFrameBuffers.find(contextId);
 
         if ((frameBufferIt != m_frameBuffers.end()) && (multisampleIt != m_multisampleFrameBuffers.end()))
         {
-            // Set up the blit target (draw framebuffer) and blit (from the read framebuffer, our multisample FBO)
-            glCheck(GLEXT_glBindFramebuffer(GLEXT_GL_DRAW_FRAMEBUFFER, frameBufferIt->second));
-            glCheck(GLEXT_glBlitFramebuffer(0,
-                                            0,
-                                            static_cast<GLint>(m_size.x),
-                                            static_cast<GLint>(m_size.y),
-                                            0,
-                                            0,
-                                            static_cast<GLint>(m_size.x),
-                                            static_cast<GLint>(m_size.y),
-                                            GL_COLOR_BUFFER_BIT,
-                                            GL_NEAREST));
-            glCheck(GLEXT_glBindFramebuffer(GLEXT_GL_DRAW_FRAMEBUFFER, multisampleIt->second));
+            auto frameBuffer            = frameBufferIt->second.lock();
+            auto multiSampleFrameBuffer = multisampleIt->second.lock();
+
+            if (frameBuffer && multiSampleFrameBuffer)
+            {
+                // Set up the blit target (draw framebuffer) and blit (from the read framebuffer, our multisample FBO)
+                glCheck(GLEXT_glBindFramebuffer(GLEXT_GL_DRAW_FRAMEBUFFER, frameBuffer->object));
+                glCheck(GLEXT_glBlitFramebuffer(0,
+                                                0,
+                                                static_cast<GLint>(m_size.x),
+                                                static_cast<GLint>(m_size.y),
+                                                0,
+                                                0,
+                                                static_cast<GLint>(m_size.x),
+                                                static_cast<GLint>(m_size.y),
+                                                GL_COLOR_BUFFER_BIT,
+                                                GL_NEAREST));
+                glCheck(GLEXT_glBindFramebuffer(GLEXT_GL_DRAW_FRAMEBUFFER, multiSampleFrameBuffer->object));
+            }
         }
     }
 
